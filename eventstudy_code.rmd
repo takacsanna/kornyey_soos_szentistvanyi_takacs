@@ -1,0 +1,371 @@
+---
+title: "eventstudy_code"
+author: "János Szentistványi"
+date: "2023-12-02"
+output: 
+    rmarkdown::pdf_document:
+        keep_tex: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message=FALSE)
+```
+
+
+```{r libraries}
+library(tidyverse)
+library(tidyquant)
+library(erer)
+library(countrycode)
+```
+
+
+
+```{r parameters}
+estimation_window <- 240
+event_date <- "2023-10-16"
+event_neg <- 3
+event_pos <- 3
+
+est_window_offset <- 0
+
+event_window <- est_window_offset + max(event_neg, event_pos)
+# indexing for selecting time series data
+ts_length <- estimation_window
+ts_offset <- est_window_offset + event_neg
+ts_event <- event_date
+
+```
+
+```{r functions}
+# AR-hez tartozó standard error - nem függ a naptól
+ARsd <- function(x) {
+  one <- evReturn2(event_data, firm = x, event.date = event_date, index = "stoxx_return", event.win = event_window, est.win = estimation_window, digits = 6)
+  as.vector(one[["ra"]][["residuals"]]) %>% 
+    `^`(2) %>% 
+    sum() %>%
+    `/`(estimation_window-2)
+}
+
+# adjusted evReturn command
+evReturn2 <- function (y, firm, event.date, y.date = "date", index = "sp500", 
+    event.win = 3, est.win = 250, digits = 4, ...) {
+    if (!is.data.frame(y)) 
+        stop("y should be a data frame.\n")
+    N <- length(firm)
+    E <- event.win * 2 + 1
+    event.date <- rep(event.date, times = N)[1:N]
+    reg.n <- c("N", "firm", "event.date", "alpha.c", "alpha.e", 
+        "alpha.t", "alpha.p", "alpha.s", "beta.c", "beta.e", 
+        "beta.t", "beta.p", "beta.s")
+    reg <- data.frame(matrix(0, nrow = N, ncol = length(reg.n)))
+    abr <- data.frame(matrix(0, nrow = E, ncol = N + 2))
+    cum <- data.frame(matrix(0, nrow = 5, ncol = N + 2))
+    colnames(reg) <- reg.n
+    colnames(abr) <- c("day", paste("Ait", firm, sep = "."), 
+        "HNt")
+    colnames(cum) <- c("item", paste("CiT", firm, sep = "."), 
+        "GNT")
+    abr$day <- -event.win:event.win
+    cum$item <- c("estimate", "error", "t.value", "p.value", 
+        "sig")
+    for (i in 1:N) {
+        loca <- which(y[, y.date] == event.date[i])
+        daEst <- y[(loca - event.win - est.win):(loca - event.win - 
+            1), c(y.date, firm[i], index)]
+        daEve <- y[(loca - event.win):(loca + event.win), c(y.date, 
+            firm[i], index)]
+        # remove part where code stops if there are NAs in the data
+        # if (sum(as.numeric(is.na(daEst))) > 0 | sum(as.numeric(is.na(daEve))) > 
+        #     0) {
+        #     stop(paste("\nSome observations in the data", "for firm --", 
+        #         firm[i], "-- are NA.\n\n", sep = " "))
+        # }
+        ra <- lm(as.formula(paste(firm[i], index, sep = "~")), 
+            data = daEst)
+        coe <- bsTab(ra, need = "5", digits = digits)
+        reg[i, "N"] <- i
+        reg[i, "firm"] <- firm[i]
+        reg[i, "event.date"] <- event.date[i]
+        reg[i, 4:13] <- c(coe[1, -1], coe[2, -1])
+        ra.co <- data.frame(summary(ra)["coefficients"])
+        abr[, i + 1] <- round(as.matrix(daEve[, firm[i]]) - ra.co[1, 
+            1] - ra.co[2, 1] * as.matrix(daEve[, index]), digits)
+        cum.c <- sum(abr[, i + 1])
+        cum.e <- sqrt(E * (as.numeric(summary(ra)["sigma"]))^2)
+        cum.t <- cum.c/cum.e
+        cum.p <- 2 * (1 - pnorm(abs(cum.t)))
+        cum[, i + 1] <- as.character(t(bsTab(data.frame(cum.c, 
+            cum.e, cum.t, cum.p), need = "5", digits = digits)[1, 
+            -1]))
+    }
+    abr$HNt <- round(cumsum(rowMeans(abr[, 2:(N + 1)])), digits)
+    GNT.c <- mean(as.numeric(cum[1, 2:(N + 1)]))
+    GNT.e <- sqrt(sum(as.numeric(cum[2, 2:(N + 1)])^2)/(N^2))
+    GNT.z <- GNT.c/GNT.e
+    GNT.p <- 2 * (1 - pnorm(abs(GNT.z)))
+    cum[, "GNT"] <- as.character(t(bsTab(data.frame(GNT.c, GNT.e, 
+        GNT.z, GNT.p), need = "5", digits = digits)[1, -1]))
+    cumu <- t(cum)[-1, ]
+    colnames(cumu) <- cum[, 1]
+    rownames(cumu) <- 1:nrow(cumu)
+    abc <- data.frame(name = colnames(cum)[-1], cumu, stringsAsFactors = FALSE)
+    result <- listn(y, y.date, firm, N, index, event.date, event.win, 
+        event.width = E, est.win, daEst, daEve, ra, digits, reg, 
+        abr, abc, call = sys.call())
+    class(result) <- "evReturn"
+    return(result)
+}
+```
+
+```{r data_import, cache=TRUE}
+
+price_raw <- rio::import("v4.xlsx", which = 3) %>% 
+  tibble
+
+# a letöltött adatokból az RI árak
+price_data <- price_raw %>% 
+  #janitor::row_to_names(1) %>% 
+  tail(-1) %>% 
+  janitor::remove_empty(which="cols") %>% 
+  mutate_at(.vars = -1,as.numeric) %>% 
+  pivot_longer(cols = 2:last_col()) %>% 
+  mutate(
+    name = stringr::str_remove_all(name, coll(" - TOT RETURN IND")),
+    Name = as.Date(Name)
+  ) %>% 
+  rename(longname = name, date = Name)
+
+cleaned_names <- rio::import("v4.xlsx", which = 4) %>% 
+  select(1,2) %>% 
+  mutate(Symbol_old = Type) %>% 
+  select(Type, Symbol_old) %>% 
+  pivot_wider(names_from = Type, values_from = 2) %>% 
+  janitor::clean_names() %>% 
+  pivot_longer(cols = everything()) %>% 
+  rename(Type = value)
+
+tickers <- rio::import("v4.xlsx", which = 4) %>% 
+  tibble() %>% 
+  select(1:2) %>% 
+  rename(longname = NAME)
+
+stoxx <- rio::import("STOXX.csv") %>% 
+  tibble() %>% 
+  select(1,6) %>% 
+  rename(
+    date = 1,
+    stoxx = 2
+  ) %>% 
+  mutate(date = as.Date(date))
+
+
+
+industry_data <- rio::import("v4.xlsx", which = 4) %>% 
+  tibble %>% 
+  select(1, 3, 4) %>% 
+  rename(Type = 1, country = 2, ind_group = 3)
+
+shares <- rio::import("v4.xlsx", which = 4) %>% 
+  tibble %>% 
+  select(1, 6) %>% 
+  rename(Type = 1, shares=2)
+
+
+
+```
+
+``` {r return_data, cache=TRUE}
+  
+est_dates <- price_data %>% 
+  select(date) %>% 
+  filter(date<=ts_event) %>% 
+  distinct() %>% 
+  arrange(date) %>% 
+  slice((n()-ts_offset-ts_length):(n()-ts_offset-1)) %>% 
+  slice(c(1,n())) %>% 
+  pull()
+
+event_price <- price_data %>% 
+  filter(date==ts_event) %>% 
+  inner_join(tickers) %>% 
+  inner_join(cleaned_names) %>% 
+  rename(event_price=value) %>% 
+  select(event_price, name)
+
+
+  
+  
+
+return_data <- price_data %>% 
+  right_join(tickers) %>% 
+  right_join(cleaned_names) %>% 
+  right_join(stoxx) %>% 
+  group_by(name) %>% 
+  mutate(
+    return = 100*(log(value) - log(lag(value))),
+    stoxx_return = 100*(log(stoxx) - log(lag(stoxx)))
+  ) %>% 
+  mutate_if(is.numeric, function(x) ifelse(is.infinite(x), NA, x)) %>% 
+  mutate_if(is.numeric, function(x) ifelse(x==0, NA,x)) %>% 
+  filter(is.na(name)==F) %>% 
+  select(date, name, Type, return, stoxx_return) %>% 
+  mutate(est_flag = ifelse((date>=est_dates[1] & date<=est_dates[2]), 1,0)) %>%
+  mutate(non_na_count = sum(!is.na(return) & est_flag==1)) %>% 
+  filter(non_na_count>100)
+
+
+  
+event_data <- return_data %>% 
+  select(-Type, -non_na_count, -est_flag) %>%
+  pivot_wider(names_from = name, values_from = return)
+
+
+```
+
+``` {r event_study}
+  
+# az elemzésben szereplő vállalatok azonosítója
+names <- unique(return_data$name)
+
+results <- evReturn2(event_data, firm = names, event.date = event_date, index = "stoxx_return", event.win = event_window, est.win = estimation_window, digits = 6)
+
+resTable <- results[["abr"]] %>% 
+  tibble() %>% 
+  pivot_longer(cols = 2:last_col()) %>% 
+  transmute(
+    day, name,
+    value = as.vector(value)
+  ) %>% 
+  pivot_wider(names_from = "day", values_from = "value") %>% 
+  slice(1:(n() - 1)) %>% 
+  select(c(1, (1+est_window_offset+1):(1+est_window_offset+event_neg+1+event_pos))) %>% 
+  drop_na() %>% 
+  mutate(
+    name = substring(name, 5),
+    sdAR = map_dbl(name, ARsd)
+  )
+  
+
+analysis_data <- resTable %>% 
+  mutate(across(2:(1+event_neg+1+event_pos), ~ .x / sqrt(sdAR),
+                .names = "tstat_{col}")) %>% 
+  rowwise() %>% 
+  mutate(
+    car = sum(c_across(2:(1+event_neg+1+event_pos)))
+  ) %>%
+  ungroup() %>% 
+  mutate(
+    t_car = car / sqrt((event_neg+1+event_pos)*sdAR)
+  ) %>% 
+  drop_na() %>% 
+  inner_join(cleaned_names) %>% 
+  inner_join(industry_data) %>% 
+  mutate(country_name = case_when(
+    country==85 ~ "SK",
+    country==68 ~ "CZ",
+    country==39 ~ "HU",
+    country==9  ~ "PL",
+    .default = "Other"
+  ))
+
+
+
+# AAR és ahhoz tartozó t-statisztikák
+analysis_data2 <- analysis_data %>% 
+  drop_na() %>% 
+  group_by(ind_group) %>% 
+  mutate(across(2:(1+event_neg+1+event_pos), mean, na.rm=TRUE,
+                .names = "aar_{col}")) %>%
+  mutate(across(2:(1+event_neg+1+event_pos), sd, na.rm=TRUE,
+                .names = "sd_ar_{col}")) %>%
+  mutate(
+    sdCAR = sd(car, na.rm=TRUE),
+    n = n()
+  ) %>% 
+  mutate((across(starts_with("aar"), .names = "tstat_{col}")*sqrt(n)) / across(starts_with("sd_ar"))) %>% 
+  ungroup() %>% 
+  rowwise() %>% 
+  mutate(
+    caar = sum(c_across(starts_with("aar")))
+  ) %>% 
+  ungroup() %>% 
+  group_by(ind_group) %>% 
+  mutate(
+    t_caar = sqrt(n)*(caar/sdCAR)
+  )
+```
+
+
+
+
+
+```{r sector_caar}
+# caar3 <- analysis_data2 %>%
+#   select(name, country_name, Type, caar, t_caar) %>%
+#   rename(caar_3 = caar, t_caar_3 = t_caar)
+# 
+# caar5 <- analysis_data2 %>%
+#   select(name, country_name, Type, caar, t_caar) %>%
+#   rename(caar_5 = caar, t_caar_5 = t_caar)
+######################################
+# caar3ind <- analysis_data2 %>%
+#   select(name, ind_group, Type, caar, t_caar) %>%
+#   rename(caar_3 = caar, t_caar_3 = t_caar)
+
+# caar5ind <- analysis_data2 %>%
+#   select(name, ind_group, Type, caar, t_caar) %>%
+#   rename(caar_5 = caar, t_caar_5 = t_caar)
+
+
+aar_table4 <- analysis_data2 %>% 
+  left_join(caar3ind) %>% 
+  left_join(caar5ind) %>% 
+  select(ind_group, `aar_-3`, `tstat_aar_-3`, aar_0, tstat_aar_0, caar_3, t_caar_3, caar_5, t_caar_5) %>% 
+  unique() %>% 
+  drop_na()
+
+# sector
+aar_ar <- aar_table4%>%
+  select(c(1,2,4,6,8)) %>% 
+  rename(
+    aar_n3 = 2
+  ) %>% 
+  mutate(Type = "AR")
+
+aar_t <- aar_table4 %>% 
+  select(c(1,3,5,7,9)) %>% 
+  rename(
+    aar_n3 = 2,
+    aar_0 = 3,
+    caar_3 = 4,
+    caar_5 = 5
+  ) %>% 
+  mutate(Type = "t-stat.")
+
+aar_table5 <- aar_ar %>% 
+  bind_rows(aar_t) %>% 
+  arrange(ind_group, Type) %>% 
+  relocate(ind_group, Type)
+
+
+```
+
+
+
+```{r analysis}
+analysis_data3 <- analysis_data2 %>% 
+  left_join(event_price) %>% 
+  left_join(shares) %>% 
+  mutate(est_value=event_price*shares) %>% 
+  rename(ar0 = `0`)
+
+reg1 <- lm(ar0~relevel(as.factor(country_name),ref="HU") + ind_group+est_value, data=analysis_data3)
+summary(reg1)
+stargazer(reg1,type = "html")
+
+```
+
+
